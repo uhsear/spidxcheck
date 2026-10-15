@@ -69,7 +69,50 @@ An excerpt of a real self-test run follows. The `...` lines stand for passing as
 here. The count in the last line is the count of the whole run.
 
 ```
-@@EXCERPT@@
+$ python spidxcheck.py --self-test
+spidxcheck self-test: temporary files and a loopback stub only, no database, no credentials
+--------------------------------------------------------------------
+PASS  an index box a little larger than the data, with the extent equal to the data, is OK
+...
+PASS  a box and an extent that start at the false origin are named as such  <-- pinned defect
+PASS  a continent-sized box over healthy data is BOX_TOO_BIG without any false origin given  <-- pinned defect
+...
+PASS  no finding says rows are lost, gone, deleted or corrupt  <-- pinned defect
+...
+PASS  a layer of one point is never called oversize, it has no size to be many times  <-- pinned defect
+...
+PASS  a world-sized box over data half a degree across is BOX_TOO_BIG, the size test does not need data of a whole unit  <-- pinned defect
+...
+PASS  a box that agrees with the stored extent, with no data envelope, is UNVERIFIED and exits 4, not 0  <-- pinned defect
+...
+PASS  a stored extent and an envelope that agree, with no index box, is UNVERIFIED and exits 4, because the index was never looked at  <-- pinned defect
+...
+PASS  a box that misses the data only at the top is a finding that names the y shortfall, never OK  <-- pinned defect
+...
+PASS  the report is exactly these lines, in this order: status, findings, reason, notes, then the boxes of a layer that is not OK, a blank line, the counts  <-- pinned defect
+...
+PASS  a blank scheme with blank grids is skipped, never guessed to be an auto grid index  <-- pinned defect
+...
+PASS  a probe answered with NaN strings, as a real ArcGIS Server does, passes and the query extent is used  <-- pinned defect
+...
+PASS  a redirect is not followed: the tool exits 2 and the redirect target is never requested  <-- pinned defect
+...
+PASS  a certificate error exits 2 and does not repeat the host name that the error text carries  <-- pinned defect
+...
+PASS  --ap, a prefix of --apply, is refused with exit 64 and nothing is written  <-- pinned defect
+...
+PASS  an address with a token given as a file is refused with exit 64 and is not repeated  <-- pinned defect
+...
+PASS  'https:', a malformed web address that gets past the web address test, exits 2 and its token is in no stream  <-- pinned defect
+...
+PASS  an unexpected exception exits 70, not the 1 that means a finding  <-- pinned defect
+...
+PASS  check() and raises() record a failure, name it, and the footer reports failures by count and by name  <-- pinned defect
+...
+PASS  importing the module prints nothing and exposes the core
+...
+--------------------------------------------------------------------
+327 assertions, 0 failed
 ```
 
 ## What already exists
@@ -110,10 +153,11 @@ Python 3.9 or newer and nothing else. No `arcpy`, no `pyodbc`, no third-party pa
 database driver. The tool never connects to a database. A person runs the export queries and
 saves the results as CSV files. The REST mode needs a network path to the service.
 
-The self-test prints the same @@COUNT@@ assertions on Windows (Python 3.13.2, 3.12.10, 3.10.20 and
+The self-test prints the same 327 assertions on Windows (Python 3.13.2, 3.12.10, 3.10.20 and
 3.9.25) and on Ubuntu (Python 3.12.3). The Windows 3.13 and Ubuntu outputs are identical line for
 line once the Windows carriage returns are removed.
-`coverage run --branch spidxcheck.py --self-test` reports 100 percent of statements and branches.
+`coverage run --branch spidxcheck.py --self-test` followed by `coverage report -m` reports 100
+percent: 1142 statements and 300 branches, none missed, with no pragma and no exclusion.
 
 ```
 git clone https://github.com/uhsear/spidxcheck.git
@@ -154,17 +198,17 @@ are refused.
 
 | Flag | Default | What it does |
 |---|---|---|
-| `CSV ...` | none | One or more files. Required unless `--rest`, `--sql` or `--self-test`. A web address given here is refused with exit 64 and is not repeated. |
+| `CSV ...` | none | One or more files. Required unless `--rest`, `--sql` or `--self-test`. A web address given here is refused with exit 64 and is not repeated. A file that cannot be opened exits 2 and is named by its place on the command line, such as "input file 2 of 3", and never by its path. A pasted address that is malformed can hold a token and still reach the file open. |
 | `--rest URL` | off | Read one hosted layer, such as `.../FeatureServer/0`. No query string, token or user name. |
 | `--timeout` | `15` | Seconds to wait for the server. Above 0 and at most 3600. |
 | `--oversize-ratio` | `10` | A box is oversize above this many times the data, measured on the larger side. |
-| `--tolerance` | `0.0001` | Slack, as a fraction of the data's larger side, before a box counts as missing it. |
+| `--tolerance` | `0.0001` | Slack, as a fraction of the data's larger side, before a box counts as missing it. The slack grows with the layer: it is 0.4 units for data 4000 units wide and 30 units for data 300000 units wide. |
 | `--false-origin=X,Y` | off | Flag a box or extent whose lower-left corner is within 1 unit of this point. Write the `=`, because a value that starts with `-` is read as a flag. |
 | `--script-out FILE` | off | Where to write the rebuild script. A dry run unless `--apply`. The file must not exist. |
 | `--pad` | `0.05` | How far the rebuilt box grows past the data, as a fraction of the data's larger side. Above 0 and at most 1. |
 | `--apply` | off | Actually write `--script-out`. Without it nothing is written. |
 | `--sql` | off | Print the export queries and exit. |
-| `--self-test` | off | Run the assertions and exit. Other flags are ignored. |
+| `--self-test` | off | Run the assertions and exit. Other valid flags are ignored. A flag with a bad value, or a flag the tool does not have, is still refused. |
 
 Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--ap` is refused
 with exit 64 instead of being read as `--apply`. The self-test pins that for every flag, and it
@@ -180,6 +224,14 @@ Each layer has up to three boxes. The tool compares the index box with the data 
 stored extent with the data envelope. If there is no envelope, it compares the index box with
 the stored extent and says so.
 
+If a layer has an index box and an envelope but no stored extent, the stored extent is not
+compared. The layer can still be OK, and the report adds the note "no stored extent was given, so
+it was not compared with the data envelope". A file is refused with exit 64 when it has a `layer`
+column and no other column the tool reads, such as an extents file that uses Esri's `minx`,
+`miny`, `maxx` and `maxy`. It is refused too when it has some of the four columns of a box and
+not all of them. Without that check, a misnamed column reads as a blank cell and the extent is
+dropped without a word.
+
 | Code | Meaning | Why it is a speed or display problem |
 |---|---|---|
 | `FALSE_ORIGIN_BOX` | The index box starts at the false origin you named. | Esri: with no extent set, ArcGIS uses the full coordinate range of the spatial reference for the box. The false origin is the minimum X and Y of the domain. |
@@ -193,8 +245,10 @@ The rules behind the codes:
 
 - A false origin finding replaces the other two for that box. The origin explains them.
 - Float noise is not a finding. The same real extent sits in two catalogs as floats that differ
-  in the last digits. The default tolerance is 0.01 percent of the data's larger side, so a miss
-  of a few units still trips it.
+  in the last digits. The default tolerance is 0.01 percent of the data's larger side. For data
+  4000 units wide that is 0.4 units, so a miss of 2 units trips it. For data 300000 units wide it
+  is 30 units, so a miss of 10 units reads as noise and the layer is OK. Lower `--tolerance` to
+  catch smaller misses on a wide layer.
 - Oversize is judged on the larger side of the data, so a layer that is one straight line, with no
   width, is not a division by zero. A layer of one point has no size, so it is never oversize.
   It can still miss.
@@ -290,9 +344,9 @@ removes.
 |---|---|
 | 0 | Every layer is OK. |
 | 1 | At least one layer has a finding. A failed `--self-test` also exits 1. |
-| 2 | A file could not be read, the script could not be written, or the server could not be read. |
+| 2 | A file could not be read, the script could not be created (for example its folder does not exist), or the server could not be read. |
 | 4 | No finding, but something could not be confirmed. A layer was UNVERIFIED or UNKNOWN, or there were no layers. |
-| 64 | Usage error, a bad number or header in a file, a file that is not UTF-8, a web address given as a file, and an abbreviated flag. |
+| 64 | Usage error, a bad number or header in a file, a file that is not UTF-8, a web address given as a file, an abbreviated flag, and a `--script-out` path that already exists. |
 | 70 | An unexpected crash. This is a fault in the tool and never a finding. |
 
 Exit 1 is the code a scheduled job reads as "a finding". That is why a crash is 70.
@@ -338,6 +392,22 @@ The first group is about the SQL and the files.
 - **Columns are matched by name and by position.** A duplicate column name in the header keeps the
   last value without a warning. Cells past the header width are ignored. An unquoted comma in a
   layer name shifts the columns, and the run is then usually refused as "not a number".
+- **An unquoted thousands separator also shifts the columns.** In a row such as `1,000` the shifted
+  row can still parse, and then the verdict comes from the wrong numbers. I saw a FINDING from
+  shifted values with exit 1. Write numbers without separators.
+- **A number below the float range is read as 0.** A value such as `1e-400` gives no error.
+- **A layer name that holds a NUL byte is accepted.** The run completes, and the report prints the
+  byte.
+- **Files and flags must not be interleaved.** `a.csv --pad 0.1 b.csv` is refused with exit 64 and
+  "unrecognized arguments (not repeated here)", because of how `argparse` handles a list of files.
+  Put every CSV before the flags or after them.
+- **A Windows path with two slashes after the drive letter is refused.** `C://data/x.csv` matches the
+  web address test and exits 64 as "a web address".
+- **If you name a file that has no layer column, the error prints that file's first line.** The
+  line is lower case. Never pass a file that holds credentials.
+- **One bad extent row stops the run.** A stored extent or envelope whose minimum is above its
+  maximum, such as a sentinel row for an empty layer, exits 64 and reads as a usage error. Later
+  layers are never judged. Remove the row and run again.
 - **`--false-origin=` with an empty value is ignored.** An unset shell variable gives that. The
   false origin check is then skipped without a warning.
 - **The rebuild statement keeps only the scheme, the grids, the cells and the box.** It does not
@@ -345,10 +415,13 @@ The first group is about the SQL and the files.
   run it.
 - **The rebuild skips values written as `16.0`.** Cells and grid values that went through a
   spreadsheet or pandas as `16.0` make the layer skip. A schema name that contains a dot is split
-  at the first dot. A name with a control character above 31, such as DEL or U+2028, passes the
-  quoting check and is quoted as given.
+  at the first dot. A name with a control character above 31, such as DEL, U+0085, U+2028 or
+  U+2029, passes the quoting check and is quoted as given. The same name is written unquoted into
+  the `-- name: CODE` comment line above each statement. I did not test how SQL Server reads those
+  characters in a comment, so the script is not guaranteed free of Unicode line separators.
 - **A cells value of more than 4300 digits crashes the rebuild.** Python refuses the number, and
-  the run exits 70 after the report prints. Nothing is written. No real file has that value.
+  the run exits 70 after the report prints. Nothing is written. No real file has that value. I
+  checked it on Python 3.13.2, 3.10.20 and 3.9.25 and it crashes the same way on all three.
 - **A layer name is printed as given.** A control or escape character in a name, from a CSV or
   from a `--rest` address, reaches the console.
 - **Nothing was timed.** The words "slower" and "narrows" follow from the documented grid and
@@ -374,6 +447,13 @@ The second group is about how the verdict is judged.
 - **Without an envelope, the box is judged against the stored extent.** A correct box that is
   smaller than a stale stored extent is then reported as `BOX_MISSES_DATA`, and the text blames the
   box when the extent is the stale one.
+- **The tolerance grows with the layer.** The slack is a fraction of the data's larger side, so on
+  data 300000 units wide the default slack is 30 units. A miss of 10 units there reads as float
+  noise. Lower `--tolerance` if you need to catch it.
+- **No stored extent means no extent check.** A layer with a box and an envelope and no stored
+  extent can be OK. The report adds a note, and the exit code stays 0.
+- **There is no verdict after a rebuild.** The tool does not check that an applied rebuild worked.
+  The only check is to export fresh files and run it again.
 - **One row per layer.** A layer with several spatial indexes has several rows in the box query.
   Give the tool one file per index, or it refuses the duplicate.
 - **Geometry only.** A geography index has no box, so only the extent is compared for it.
@@ -390,17 +470,40 @@ The third group is about the REST mode and the self-test.
   extent as plain numbers. If a server returns them in different coordinate systems, the verdict
   is meaningless.
 - **`--timeout` applies to each socket read.** A server that sends a few bytes at a time can run
-  far past it. A trial server that sent 10 bytes every 0.4 seconds held a run with `--timeout 1`
-  open for about 5 seconds.
-- **A bad value for a numeric flag is repeated.** `--timeout abc` prints "invalid float value:
-  'abc'". Only words that no flag accepts are left out of the message.
-- **The self-test opens about 40 loopback connections.** On a machine with tens of thousands of
-  sockets in TIME_WAIT, the REST assertions fail until the sockets expire. The failure gives no hint
-  that ports are the cause. I caused this once with 500 parallel runs.
+  far past it. A trial server that declared a 125-byte body and sent 10 bytes every 0.4 seconds
+  held a run with `--timeout 1` open for 5 seconds. With a declared body of 100,000 bytes the same
+  trial was still running after 30 seconds, when I stopped it. The time depends on the body size.
+- **A bad value for a flag is repeated.** `--timeout abc` prints "invalid float value: 'abc'", and
+  `--false-origin=abc` prints "'abc' is not X,Y". Only words that no flag accepts are left out of
+  the message. Never put a secret in a flag value.
+- **A `--rest` address must be percent-encoded ASCII.** A non-ASCII character in the path exits 64
+  with a codec message, and not with a usage message. The message does not name the address.
+- **The report prints the last three path segments of a `--rest` address.** Put no key in the path.
+  The tool refuses a query string, but it cannot tell a key in the path from a service name.
+- **Deeply nested JSON from a server crashes the run.** An answer of about 100,000 opening
+  brackets makes `json.loads` raise `RecursionError`. The tool catches `ValueError` only, so
+  `--rest` exits 70 with a traceback and not 2 with "the answer is not JSON".
+- **The self-test opens about 40 loopback connections.** I counted 44 on Windows with Python 3.13.2.
+  On a machine with tens of thousands of sockets in TIME_WAIT, the REST assertions fail until the
+  sockets expire. The failure gives no hint that ports are the cause. I caused this once with 500
+  parallel runs. I also saw one workstation with about 48,000 sockets in TIME_WAIT end a self-test
+  with exit 70 and a traceback, and another time with one REST assertion failed. Several parallel
+  copies gave `OSError WinError 10048`, and a coverage run made while they ran reported 93 percent.
+  Run one self-test or one coverage run at a time, and run it again after the sockets expire.
 - **The self-test and the exit code.** A failed `--self-test` exits 1, the code that also means a
-  finding.
-- **Every line is covered.** There are no uncovered lines to name. The coverage run uses no
-  pragma and no exclusion.
+  finding. A scheduler cannot tell a broken tool from a dirty layer in that one mode. A build whose
+  `main()` returned `None` would print FAIL lines and still exit 0, because `sys.exit(None)` is 0.
+  Only the FAIL lines show it.
+- **Run it with Python 3.9 or newer.** 3.9.25 is the oldest interpreter the self-test ran on. A
+  much older one, such as the `python` in the first line of the file on a host where that name is
+  Python 2, will not run the file. I did not run Python 2. An interpreter that fails with an
+  uncaught error exits 1, which a scheduler reads as a finding.
+- **The harness is checked outside itself.** The checks of `check()`, `raises()` and the footer go
+  through a separate `must()` that stops the run. A harness checked only by itself cannot report
+  its own fault. I ran mutated copies to confirm that an always-true `check()` and a footer that
+  hides a failure both stop the run.
+- **Every line is covered.** `coverage report -m` lists no missed line and no partial branch. The
+  coverage run uses no pragma and no exclusion.
 
 ## Sources
 
@@ -425,9 +528,13 @@ page on 2026-10-13 and read the passage named.
   the level 0 counts, the primary filter row counts, and the bounding box properties.
 - Esri, [SQL Server spatial types and ArcGIS](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/manage-sql-server/sqlserver-spatial-types-and-arcgis.html):
   the box comes from the feature class extent, the full coordinate range is used when no extent
-  is set, features outside the box are not indexed but are returned, the box follows the latest
+  is set (it does not say where that range starts), features outside the box are not indexed but are returned, the box follows the latest
   extent when the index is dropped and re-created, and a versioned feature class has a spatial
   index on its adds table.
+  One link in the `FALSE_ORIGIN_BOX` message is my inference. The SQL Server page says that the
+  full coordinate range of the spatial reference is used when no extent is set. The ArcObjects page
+  below says that the false origin is the minimum X and Y of the domain. No page I read joins the
+  two, so the sentence "that range starts at the false origin" is a conclusion from both.
 - Esri, [Recalculate Feature Class Extent](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/recalculate-feature-class-extent.html):
   it reads all the features and updates the extent property, an enterprise extent needs an
   exclusive schema lock, and the extent covers all versions until a compress.
@@ -467,7 +574,11 @@ synthetic CSV files, a loopback stub, and once an Esri public sample server.
 | A blank scheme is not guessed. | A blank scheme with blank grids is skipped, an auto grid with grids is skipped, and the false origin box case gets a statement. |
 | Abbreviated flags are refused. | A prefix of every flag, with the self-test stubbed. |
 | Exit 70 for a crash and the self-test status. | A forced exception and a stubbed self-test. |
-| The harness reports a failure. | A probe harness fed failing cases. |
+| The harness reports a failure. | A probe harness fed failing cases, checked through `must()` and not through `check()`. |
+| A layer in degrees is judged. | A world-sized box over data half a degree across, its ratio text, and its rebuild statement. |
+| An unread stored extent is not silent. | The "no stored extent was given" note, and the refusal of a file with unknown or partial box columns. |
+| A malformed address given as a file leaks no token. | Three malformed addresses with a token, checked on both streams. |
+| The script file is opened for exclusive creation. | A run where the exists check is made to say no and the file is still there. |
 | The Limits sentences. | Each was reproduced by hand on a synthetic file before it was written. |
 
 Five things were found by running the tool or its mutants, not by reading it. Without the probe,

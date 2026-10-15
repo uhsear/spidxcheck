@@ -64,8 +64,9 @@ import urllib.request
 DEFAULT_OVERSIZE_RATIO = 10.0
 
 # Two catalogs hold the same real extent as floats that differ in the last digits.
-# The tolerance is this fraction of the data's larger side, so a true miss of even
-# a few feet still trips it and round-trip noise does not.
+# The tolerance is this fraction of the data's larger side. The slack grows with
+# the layer: 1e-4 of a layer 300000 units wide is 30 units, so a miss of a few
+# units on a layer that wide is read as noise. Lower --tolerance to catch it.
 DEFAULT_TOLERANCE = 1e-4
 
 # The rebuild script grows the data envelope by this fraction of its larger side,
@@ -274,6 +275,9 @@ def assess(layer, ratio=DEFAULT_OVERSIZE_RATIO, tol=DEFAULT_TOLERANCE,
         compared = True
         found = compare("BOX", box, ref, ref_name, ratio, tol, origin)
         findings.extend(found)
+        if layer.env is not None and layer.ext is None:
+            notes.append("no stored extent was given, so it was not compared "
+                         "with the data envelope")
         if (layer.scheme.upper() == "GEOMETRY_AUTO_GRID"
                 and any(code == "BOX_TOO_BIG" for code, _ in found)):
             notes.append("this is an auto grid index, which Microsoft "
@@ -473,11 +477,38 @@ TEXTS = (("index_name", "index_name"), ("spatial_column", "column"),
 GRID_COLS = ("level_1_grid", "level_2_grid", "level_3_grid", "level_4_grid")
 
 
+def check_header(header, path):
+    """Refuse a file whose columns would be skipped without a word.
+
+    A reader that looks a column up by name and finds none treats the cell as
+    blank, so a file with Esri's minx, miny, maxx and maxy would give no stored
+    extent and no error."""
+    known = set(c for _, cols, _ in QUADS for c in cols)
+    known.update(GRID_COLS)
+    known.update(c for c, _ in TEXTS)
+    if not known.intersection(header):
+        raise ValueError("%s: no column this tool reads besides layer. Name "
+                         "the columns as the README table shows" % path)
+    for _, cols, _ in QUADS:
+        have = [c for c in cols if c in header]
+        if 0 < len(have) < 4:
+            raise ValueError("%s: it has %s but not all four of %s"
+                             % (path, ", ".join(have), ", ".join(cols)))
+
+
 def read_layers(paths):
     """Merge one or more CSV files into layers, keyed on the layer column."""
     layers = {}
-    for path in paths:
-        with open(path, newline="", encoding="utf-8-sig") as handle:
+    for number, path in enumerate(paths, 1):
+        try:
+            handle = open(path, newline="", encoding="utf-8-sig")
+        except OSError as exc:
+            # The OS text names the path. A pasted web address can hold a
+            # token and reach open() when it is malformed, so name the file
+            # by its place on the command line instead.
+            raise OSError(exc.errno, "input file %d of %d: %s" % (
+                number, len(paths), exc.strerror or type(exc).__name__))
+        with handle:
             reader = csv.reader(handle)
             first = next(reader, None)
             if first is None:
@@ -486,6 +517,7 @@ def read_layers(paths):
             if "layer" not in header:
                 raise ValueError("%s: no layer column. It has: %s"
                                  % (path, ", ".join(header)))
+            check_header(header, path)
             seen = set()
             for row in reader:
                 if not row:
@@ -880,15 +912,22 @@ class Harness(object):
             self.check(False, "%s (no error raised)" % label)
 
     def summary(self):
+        # No branch here: the footer and the status come from the same count,
+        # so a mutated condition cannot print "0 failed" over FAIL lines.
         print("-" * 68)
-        total = self.passed + len(self.failed)
-        if self.failed:
-            print("%d assertions, %d failed" % (total, len(self.failed)))
-            for label in self.failed:
-                print("  FAILED: %s" % label)
-            return 1
-        print("%d assertions, 0 failed" % total)
-        return 0
+        print("%d assertions, %d failed"
+              % (self.passed + len(self.failed), len(self.failed)))
+        for label in self.failed:
+            print("  FAILED: %s" % label)
+        return min(1, len(self.failed))
+
+
+def must(cond, label):
+    """Stop the run when a check of the harness itself fails. The harness
+    cannot vouch for itself: a check() that always passes also passes the
+    probe that is meant to catch it, so this does not go through it."""
+    if not cond:
+        raise AssertionError(label)
 
 
 def self_test():
@@ -1052,6 +1091,36 @@ def _self_test(tmp):
     check(codes(r) == ["BOX_MISSES_DATA"],
           "a box that does not hold a layer of one point is a miss")
 
+    # ---- data under one unit across, which is every layer in degrees
+    DEG = (-82.5, 29.0, -82.0, 29.5)
+    WORLD = (-180.0, -90.0, 180.0, 90.0)
+    r = assess(layer("a.t", WORLD, DEG, DEG))
+    check(codes(r) == ["BOX_TOO_BIG"] and r.status == FINDING,
+          "a world-sized box over data half a degree across is BOX_TOO_BIG, "
+          "the size test does not need data of a whole unit" + pinned)
+    check("720 times" in dict(r.findings)["BOX_TOO_BIG"],
+          "and the finding says the box is 720 times the data, the ratio "
+          "of the two larger sides" + pinned)
+    r = assess(layer("a.t", PLANET, DATA, DATA))
+    check("4500 times" in dict(r.findings)["BOX_TOO_BIG"],
+          "a continent-sized box over the 4000 unit data says 4500 times"
+          + pinned)
+
+    # ---- the tolerance is a fraction of the layer, so it grows with it
+    wide = (0.0, 0.0, 300000.0, 300000.0)
+    r = assess(layer("a.t", (10.0, 0.0, 300000.0, 300000.0), None, wide))
+    check(r.status == OK,
+          "a box 10 units short of data 300000 units wide is inside the "
+          "default slack of 30 units, so it reads OK" + pinned)
+    r = assess(layer("a.t", (10.0, 0.0, 300000.0, 300000.0), None, wide),
+               tol=1e-5)
+    check(codes(r) == ["BOX_MISSES_DATA"],
+          "and the same miss is found when --tolerance is 1e-5" + pinned)
+    r = assess(layer("a.t", (10.0, 0.0, 4000.0, 4000.0), None,
+                     (0.0, 0.0, 4000.0, 4000.0)))
+    check(codes(r) == ["BOX_MISSES_DATA"],
+          "the same 10 unit miss on data 4000 units wide is found" + pinned)
+
     # ---- a run that compared nothing is never clean
     r = assess(layer("a.t", GOOD, DATA, None))
     check(r.status == UNVERIFIED and verdict([r]) == 4,
@@ -1112,6 +1181,19 @@ def _self_test(tmp):
     r = assess(layer("a.t", None, PLANET, DATA, scheme="geography_auto_grid"))
     check(codes(r) == ["EXTENT_TOO_BIG"] and not r.notes,
           "the geography test ignores case and an absent box adds no note")
+    r = assess(layer("a.t", None, DATA, DATA, scheme="GEOGRAPHY_AUTO_GRID"))
+    check(r.status == OK,
+          "an auto grid geography index is a geography index too, so the "
+          "same layer is OK" + pinned)
+
+    # ---- a stored extent that was not given is said so, not skipped quietly
+    r = assess(layer("a.t", GOOD, None, DATA))
+    check(r.status == OK and any("no stored extent was given" in n
+                                 for n in r.notes),
+          "a box and an envelope that agree, with no stored extent, are OK "
+          "and the report says the stored extent was not compared" + pinned)
+    r = assess(layer("a.t", GOOD, DATA, DATA))
+    check(not r.notes, "with a stored extent given there is no such note")
 
     # ---- which edge of the data sticks out, one edge at a time
     outer = (2.0, 3.0, 12.0, 23.0)
@@ -1237,6 +1319,10 @@ def _self_test(tmp):
     check(sql is None and "tessellation_scheme" in why,
           "a blank scheme with blank grids is skipped, never guessed to be "
           "an auto grid index" + pinned)
+    sql, why = rebuild_statement(layer("dbo.deg", **dict(base, env=DEG)))
+    check(sql is not None and why is None and "-82.525" in sql,
+          "a layer in degrees, half a degree across, gets a rebuild "
+          "statement and is not skipped as one point" + pinned)
     sql, _ = rebuild_statement(layer("dbo.roads", **base))
     box = sql.split("BOUNDING_BOX = (")[1].split(")")[0].split(", ")
     check(float(box[0]) < 1000.0 and float(box[2]) > 5000.0
@@ -1312,6 +1398,13 @@ def _self_test(tmp):
           and "Nothing here was run." in body and body.endswith(";\n")
           and "schema modification lock" in body,
           "the script says it was not run and that the rebuild takes a lock")
+    check("cannot be rebuilt online" in body
+          and "In a geodatabase, Esri documents that the box is taken from "
+              "the feature class extent" in body
+          and "Recalculate the extent first" in body
+          and "grown by 0.05 of its larger side" in body,
+          "the script header warns about the online rebuild limit, the "
+          "geodatabase extent and the pad fraction" + pinned)
     check(all(ord(c) < 128 for c in body),
           "the script text is ASCII when the names are")
 
@@ -1405,16 +1498,19 @@ def _self_test(tmp):
     bad_file("b2.csv", "name,box_xmin\nx,1\n",
              "a file with no layer column is refused")
 
-    def refusal(path):
+    def refusal(*paths):
         try:
-            read_layers([path])
+            read_layers(list(paths))
         except ValueError as exc:
             return str(exc)
         return "no error was raised"
 
     check("no layer column" in refusal(os.path.join(tmp, "b2.csv")),
           "and the refusal says so, not that a name is blank" + pinned)
-    bad_file("b3.csv", "layer,box_xmin\n  ,1\n", "a blank layer name is refused")
+    check(refusal(boxes) == "no error was raised",
+          "the helper that reads a refusal says so when a file is fine")
+    bad_file("b3.csv", "layer,box_xmin,box_ymin,box_xmax,box_ymax\n"
+             "  ,1,2,3,4\n", "a blank layer name is refused")
     check("layer name is blank" in refusal(put("b3b.csv",
                                                "layer,index_name\n  ,x\n")),
           "a blank layer name is refused for that reason alone" + pinned)
@@ -1445,7 +1541,7 @@ def _self_test(tmp):
              "the same layer twice in one file is refused, whatever its case")
     bad_file("b5b.csv", "layer,index_name\nstra\u00dfe.t,x\nSTRASSE.T,x\n",
              "the same layer twice is refused whatever its case, ss included")
-    bad_file("b6.csv", "env_xmin,layer\n1\n",
+    bad_file("b6.csv", "env_xmin,env_ymin,env_xmax,env_ymax,layer\n1\n",
              "a row too short to reach the layer column is a refusal, not a "
              "crash" + pinned)
     try:
@@ -1455,14 +1551,25 @@ def _self_test(tmp):
         check("bad2.csv line 4" in str(exc) and "env_ymin" in str(exc),
               "a blank line does not move the reported line off the file"
               + pinned)
+    nl = read_layers([put("nl.csv", 'layer,index_name\n"a\r\nb",x\n')])[0]
+    check(nl.name == "a\r\nb",
+          "a quoted newline inside a cell is kept as it was, so the file is "
+          "opened with newline=''" + pinned)
+    esri = put("esri.csv", "layer,minx,miny,maxx,maxy\na.t,1,2,3,4\n")
+    check("no column this tool reads" in refusal(esri),
+          "a file whose columns are all unknown, such as Esri's minx names, "
+          "is refused and does not read as an empty extent" + pinned)
+    part = put("part.csv", "layer,ext_xmin,ext_ymin,ext_xmax\na.t,1,2,3\n")
+    check("not all four of ext_xmin" in refusal(part),
+          "a file with three of the four extent columns is refused" + pinned)
+    code, out, err = go([boxes, esri, envs])
+    check(code == 64 and out == "" and "esri.csv" in err,
+          "and the run exits 64 naming the file, so no layer reads OK on a "
+          "stored extent that was never compared" + pinned)
     raises(lambda: read_layers([boxes, boxes]),
            "a box given in two files is refused")
     for given, word in ((boxes, "box"), (extents, "ext"), (envs, "env")):
-        try:
-            read_layers([given, given])
-            said = "no error was raised"
-        except ValueError as exc:
-            said = str(exc)
+        said = refusal(given, given)
         check("its %s in two files" % word in said,
               "the refusal of a %s given twice names it" % word)
     other = put("other.csv", "layer,index_name\ndbo.roads,ix_other\n")
@@ -1890,7 +1997,7 @@ def _self_test(tmp):
     code, out, err = go([boxes, extents])
     check(code == 4 and "UNVERIFIED" in out,
           "with no data envelope every layer is UNVERIFIED and the run exits 4")
-    header_only = put("empty.csv", "layer,env_xmin\n")
+    header_only = put("empty.csv", "layer,env_xmin,env_ymin,env_xmax,env_ymax\n")
     code, out, err = go([header_only])
     check(code == 4 and "0 layer(s)" in out,
           "a file with a header and no rows exits 4, not 0" + pinned)
@@ -1900,7 +2007,9 @@ def _self_test(tmp):
     code, out, err = go([good_only])
     check(code == 0 and "1 OK" in out, "a clean file exits 0")
     code, out, err = go([os.path.join(tmp, "nope.csv")])
-    check(code == 2 and "nope.csv" in err, "a file that cannot be read exits 2")
+    check(code == 2 and "input file 1 of 1" in err and "nope.csv" not in err,
+          "a file that cannot be read exits 2 and is named by its place on "
+          "the command line, never by its path" + pinned)
     code, out, err = go([tmp])
     check(code == 2, "a directory in place of a file exits 2")
     code, out, err = go([put("badnum.csv", "layer,env_xmin,env_ymin,env_xmax,"
@@ -1984,6 +2093,15 @@ def _self_test(tmp):
               "%s given as a file is refused with exit 64 and is not "
               "repeated" % ("an address with a token" if "S3" in given else
                             "another address") + pinned)
+    for given in (" https://h/arcgis/rest/services/R/FeatureServer/0?token="
+                  "S3CRET", "HTTP:/h/x?token=S3CRET",
+                  "https:/h/x?token=S3CRET"):
+        code, out, err = go([given])
+        check(code == 2 and out == "" and "S3CRET" not in err
+              and "token" not in err and "input file 1 of 1" in err,
+              "%s, a malformed web address that gets past the web address "
+              "test, exits 2 and its token is in no stream"
+              % ascii(given[:6]) + pinned)
     check(WEB_ADDRESS.match("C:\\data\\x.csv") is None
           and WEB_ADDRESS.match("data/x.csv") is None,
           "a Windows path and a relative path are not web addresses")
@@ -2017,6 +2135,19 @@ def _self_test(tmp):
         check(code == 64 and handle.read() == written,
               "a second --apply is refused with exit 64 and leaves the first "
               "script as it was" + pinned)
+    saved_exists = os.path.exists
+    os.path.exists = lambda path: False
+    try:
+        code, out, err = go([boxes, extents, envs, "--script-out", out_sql,
+                             "--apply"])
+    finally:
+        os.path.exists = saved_exists
+    with open(out_sql, encoding="utf-8") as handle:
+        check(code == 2 and "could not write" in err
+              and handle.read() == written,
+              "a script file that appears after the exists check is not "
+              "overwritten: the file is opened for exclusive creation"
+              + pinned)
     code, out, err = go([boxes, extents, envs, "--script-out",
                          os.path.join(tmp, "no", "dir", "x.sql"), "--apply"])
     check(code == 2 and "could not write" in err,
@@ -2101,6 +2232,13 @@ def _self_test(tmp):
           "main returns the exit status of --self-test, so a red self-test "
           "fails CI" + pinned)
 
+    # The harness cannot vouch for itself. These checks go through must(), not
+    # check(): a check() that always passed would pass its own probe, and a
+    # summary() that hid a failure would print "0 failed" over FAIL lines.
+    def hard(cond, label):
+        must(cond, label)
+        check(True, label)
+
     probe = Harness()
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -2111,19 +2249,28 @@ def _self_test(tmp):
         probe.check(True, "probe five")
         red = probe.summary()
     printed = buf.getvalue()
-    check(red == 1 and probe.passed == 2 and len(probe.failed) == 3
-          and "no error raised" in printed and "wrong exception" in printed
-          and "5 assertions, 3 failed" in printed
-          and "  FAILED: probe one" in printed,
-          "check() and raises() record a failure, name it, and the footer "
-          "reports failures by count and by name" + pinned)
+    hard(red == 1 and probe.passed == 2 and len(probe.failed) == 3
+         and "no error raised" in printed and "wrong exception" in printed
+         and "5 assertions, 3 failed" in printed
+         and "  FAILED: probe one" in printed,
+         "check() and raises() record a failure, name it, and the footer "
+         "reports failures by count and by name" + pinned)
     probe = Harness()
     with contextlib.redirect_stdout(io.StringIO()):
         probe.raises(lambda: to_number("x", "w"), "accepts the ValueError")
         probe.raises(lambda: extent_of(5, "x"), "accepts a named kind",
                      kind=RestError)
-    check(probe.passed == 2 and not probe.failed,
-          "and raises() accepts the exception it is looking for")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        green = probe.summary()
+    hard(probe.passed == 2 and not probe.failed and green == 0
+         and "2 assertions, 0 failed" in buf.getvalue(),
+         "raises() accepts the exception it is looking for, and a clean "
+         "harness ends with 0 failed and status 0" + pinned)
+    raises(lambda: must(False, "probe"),
+           "must() stops the run on a false condition" + pinned,
+           kind=AssertionError)
+    check(must(True, "probe") is None, "and passes a true one")
 
     # ---- importing the module runs nothing
     import importlib.util
