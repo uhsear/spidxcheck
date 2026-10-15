@@ -45,6 +45,7 @@ import math
 import os
 import re
 import shutil
+import ssl
 import sys
 import tempfile
 import traceback
@@ -89,6 +90,7 @@ BOX_CODES = ("FALSE_ORIGIN_BOX", "BOX_MISSES_DATA", "BOX_TOO_BIG")
 
 NUMBER = re.compile(r"[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?", re.ASCII)
 DIGITS = re.compile(r"[0-9]+", re.ASCII)
+WEB_ADDRESS = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://", re.ASCII)
 GRID_NAMES = {"16": "LOW", "64": "MEDIUM", "256": "HIGH"}
 
 # What each kind of comparison is called, its three codes, and what each means.
@@ -106,9 +108,10 @@ KINDS = {
         "y). Features outside the box are not indexed, so the index cannot "
         "narrow a query for them. They are still returned by spatial "
         "queries, so results stay correct; those queries are slower.",
-        "the index box is %s times the %s across. The features share few "
-        "grid cells, so a spatial filter keeps many candidate rows for the "
-        "exact test. Results stay correct; queries are slower."),
+        "the index box is %s times the %s across. The features share fewer "
+        "grid cells than a snug box would give, so a spatial filter keeps "
+        "more candidate rows for the exact test. Results stay correct; "
+        "queries are slower."),
     "EXTENT": (
         "stored extent", "FALSE_ORIGIN_EXTENT", "EXTENT_CLIPS_DATA",
         "EXTENT_TOO_BIG",
@@ -253,7 +256,8 @@ def assess(layer, ratio=DEFAULT_OVERSIZE_RATIO, tol=DEFAULT_TOLERANCE,
     """Decide one layer. Never calls a layer OK when it compared nothing."""
     notes = list(layer.notes)
     box = layer.box
-    if box is not None and layer.scheme.upper().startswith("GEOGRAPHY"):
+    geography = layer.scheme.upper().startswith("GEOGRAPHY")
+    if box is not None and geography:
         box = None
         notes.append("a geography index has no bounding box, so the index "
                      "box was not compared")
@@ -268,7 +272,14 @@ def assess(layer, ratio=DEFAULT_OVERSIZE_RATIO, tol=DEFAULT_TOLERANCE,
     compared = False
     if box is not None:
         compared = True
-        findings.extend(compare("BOX", box, ref, ref_name, ratio, tol, origin))
+        found = compare("BOX", box, ref, ref_name, ratio, tol, origin)
+        findings.extend(found)
+        if (layer.scheme.upper() == "GEOMETRY_AUTO_GRID"
+                and any(code == "BOX_TOO_BIG" for code, _ in found)):
+            notes.append("this is an auto grid index, which Microsoft "
+                         "describes as 8 grid levels where a manual grid has "
+                         "4, so the slowdown is likely smaller. Nothing was "
+                         "timed")
     if layer.env is not None and layer.ext is not None:
         compared = True
         findings.extend(compare("EXTENT", layer.ext, layer.env,
@@ -284,6 +295,10 @@ def assess(layer, ratio=DEFAULT_OVERSIZE_RATIO, tol=DEFAULT_TOLERANCE,
                       "stored extent, but no data envelope was given, so "
                       "nothing measured the features. A stale extent hides a "
                       "stale box.", notes)
+    if box is None and not geography:
+        return Result(layer, UNVERIFIED, [], "no index box was given, so the "
+                      "spatial index itself was not compared. The stored "
+                      "extent and the data envelope agree.", notes)
     return Result(layer, OK, [], "", notes)
 
 
@@ -356,15 +371,20 @@ def rebuild_statement(layer, pad=DEFAULT_PAD):
         return None, ("the layer name must be schema.table, and the index "
                       "name and spatial column must be given, each without "
                       "control characters")
-    if all(v == "" for v in layer.grids):
-        if layer.scheme.upper() not in ("", "GEOMETRY_AUTO_GRID"):
-            return None, "the grid densities are missing for a manual grid index"
+    scheme = layer.scheme.upper()
+    if scheme == "GEOMETRY_AUTO_GRID":
+        if any(layer.grids):
+            return None, "an auto grid index has no grid densities, but some were given"
         using, grids = "USING GEOMETRY_AUTO_GRID", ""
-    else:
+    elif scheme == "GEOMETRY_GRID":
         levels = [GRID_NAMES.get(v) for v in layer.grids]
         if None in levels:
             return None, "the grid densities are not four values of 16, 64 or 256"
         using, grids = "USING GEOMETRY_GRID", ", GRIDS = (%s)" % ", ".join(levels)
+    else:
+        return None, ("tessellation_scheme is missing or is not GEOMETRY_GRID "
+                      "or GEOMETRY_AUTO_GRID, and a guess would change the "
+                      "index type")
     if not DIGITS.fullmatch(layer.cells) or not 1 <= int(layer.cells) <= 8192:
         return None, "cells per object is missing or not from 1 to 8192"
     p = pad * s
@@ -545,18 +565,33 @@ def check_rest_url(url):
     return "%s://%s%s" % (parts.scheme, parts.netloc, path), "/".join(segments[-3:])
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect. A Location header is data from the server, and
+    following it would send the request, and take the verdict, from a host the
+    operator never named."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
 def get_json(url, timeout):
     request = urllib.request.Request(
         url, headers={"Accept": "application/json", "User-Agent": "spidxcheck"})
     try:
-        with contextlib.closing(urllib.request.urlopen(request, timeout=timeout)) as resp:
+        with contextlib.closing(OPENER.open(request, timeout=timeout)) as resp:
             body = resp.read(MAX_BODY + 1)
     except urllib.error.HTTPError as exc:
         exc.close()
         raise RestError("the server answered HTTP %d" % exc.code)
     except (OSError, http.client.HTTPException) as exc:
-        raise RestError("could not read the server (%s)"
-                        % getattr(exc, "reason", type(exc).__name__))
+        # The text of a TLS error can name the host, so only the class is kept.
+        reason = getattr(exc, "reason", exc)
+        what = ("the TLS handshake or certificate was not accepted"
+                if isinstance(reason, ssl.SSLError) else type(reason).__name__)
+        raise RestError("could not read the server (%s)" % what)
     if len(body) > MAX_BODY:
         raise RestError("the answer is larger than %d bytes" % MAX_BODY)
     try:
@@ -573,11 +608,20 @@ def get_json(url, timeout):
     return data
 
 
+def no_number(value):
+    """True for what a server sends in place of a coordinate: null or NaN."""
+    return value is None or value == "NaN" or (
+        type(value) is float and math.isnan(value))
+
+
 def extent_of(value, what):
-    """(xmin, ymin, xmax, ymax) from an Esri extent object, None when absent."""
-    if value is None:
-        return None
+    """(xmin, ymin, xmax, ymax) from an Esri extent object. None when absent,
+    and when every coordinate is null or NaN, which is how an ArcGIS Server
+    answers a returnExtentOnly query that matches no feature."""
     keys = ("xmin", "ymin", "xmax", "ymax")
+    if value is None or (isinstance(value, dict)
+                         and all(no_number(value.get(k)) for k in keys)):
+        return None
     if (not isinstance(value, dict)
             or not all(type(value.get(k)) in (int, float)
                        and abs(value[k]) < 1e300 for k in keys)
@@ -609,9 +653,12 @@ def fetch_rest(url, timeout=DEFAULT_TIMEOUT):
     layer.notes.append("here the stored extent is the layer's advertised "
                        "extent property. Esri's documentation does not say "
                        "whether a service reads it from the stored extent")
-    if info.get("supportsReturningQueryExtent") is not True:
+    caps = info.get("advancedQueryCapabilities")
+    if (not isinstance(caps, dict)
+            or caps.get("supportsReturningQueryExtent") is not True):
         layer.notes.append("the layer does not advertise "
-                           "supportsReturningQueryExtent, so no data envelope "
+                           "supportsReturningQueryExtent in its "
+                           "advancedQueryCapabilities, so no data envelope "
                            "was read")
         return layer
     answer = get_json(query_url(base, "1=1"), timeout)
@@ -639,6 +686,9 @@ def fetch_rest(url, timeout=DEFAULT_TIMEOUT):
 
 def check_options(args):
     """The first usage error in the parsed options, or None."""
+    if any(WEB_ADDRESS.match(f) for f in args.files):
+        # Not repeated: an address can carry a token, and an OS error echoes it.
+        return "a web address was given as a file. Use --rest for a hosted layer"
     if not 1 < args.oversize_ratio < float("inf"):
         return "--oversize-ratio must be above 1"
     if not 0 <= args.tolerance < 1:
@@ -655,8 +705,17 @@ def check_options(args):
     return None
 
 
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse lists the unrecognized words, and one of them can be a
+        # secret typed after a flag this tool does not have.
+        if message.startswith("unrecognized arguments"):
+            message = "unrecognized arguments (not repeated here)"
+        super().error(message)
+
+
 def parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = Parser(
         prog="spidxcheck.py",
         description="Compare a spatial index box, a stored extent and the "
                     "data envelope, and say where they disagree.",
@@ -1014,6 +1073,15 @@ def _self_test(tmp):
         r = assess(layer("a.t", **given))
         check(r.status == UNKNOWN and verdict([r]) == 4 and r.reason,
               "%s is UNKNOWN with a reason and exits 4" % label)
+    r = assess(layer("a.t", None, DATA, DATA))
+    check(r.status == UNVERIFIED and verdict([r]) == 4
+          and "no index box" in r.reason,
+          "a stored extent and an envelope that agree, with no index box, is "
+          "UNVERIFIED and exits 4, because the index was never looked at"
+          + pinned)
+    r = assess(layer("a.t", None, DATA, DATA, scheme="GEOGRAPHY_GRID"))
+    check(r.status == OK,
+          "the same layer on a geography index is OK, it has no box to give")
     check(verdict([]) == 4, "a run with no layers exits 4" + pinned)
     check(verdict([assess(layer("a.t", PLANET, DATA, DATA)),
                    assess(layer("b.t", GOOD, DATA, None))]) == 1,
@@ -1021,6 +1089,20 @@ def _self_test(tmp):
     check(verdict([assess(layer("a.t", GOOD, DATA, DATA)),
                    assess(layer("b.t", GOOD, DATA, None))]) == 4,
           "one unverified layer among OK layers still exits 4")
+
+    # ---- an auto grid index is not worded like a four level manual grid
+    r = assess(layer("a.t", PLANET, DATA, DATA, scheme="GEOMETRY_AUTO_GRID"))
+    check(codes(r) == ["BOX_TOO_BIG"] and any("auto grid" in n and
+                                              "likely smaller" in n
+                                              for n in r.notes),
+          "an oversize box on an auto grid index says the slowdown is likely "
+          "smaller and was not timed" + pinned)
+    r = assess(layer("a.t", PLANET, DATA, DATA, scheme="GEOMETRY_GRID"))
+    check(codes(r) == ["BOX_TOO_BIG"] and not r.notes,
+          "an oversize box on a manual grid index adds no such note")
+    r = assess(layer("a.t", GOOD, DATA, DATA, scheme="GEOMETRY_AUTO_GRID"))
+    check(r.status == OK and not r.notes,
+          "an auto grid index with a sound box adds no note")
 
     # ---- a geography index has no box
     r = assess(layer("a.t", GOOD, DATA, DATA, scheme="GEOGRAPHY_GRID"))
@@ -1031,19 +1113,91 @@ def _self_test(tmp):
     check(codes(r) == ["EXTENT_TOO_BIG"] and not r.notes,
           "the geography test ignores case and an absent box adds no note")
 
+    # ---- which edge of the data sticks out, one edge at a time
+    outer = (2.0, 3.0, 12.0, 23.0)
+    for inner, want, label in (
+            ((3.0, 4.0, 11.0, 22.0), (0.0, 0.0), "data inside the box"),
+            ((-1.0, 4.0, 11.0, 22.0), (3.0, 0.0), "data past the left edge"),
+            ((3.0, 4.0, 16.0, 22.0), (4.0, 0.0), "data past the right edge"),
+            ((3.0, -2.0, 11.0, 22.0), (0.0, 5.0), "data past the bottom edge"),
+            ((3.0, 4.0, 11.0, 30.0), (0.0, 7.0), "data past the top edge"),
+            ((-2.0, -1.0, 17.0, 29.0), (5.0, 6.0), "data past all four edges")):
+        check(shortfall(outer, inner) == want,
+              "%s is short by %r in x and y" % (label, want) + pinned)
+    outer = (0.0, 0.0, 10.0, 10.0)
+    r = assess(layer("a.t", outer, None, (1.0, 1.0, 9.0, 12.0)))
+    check(codes(r) == ["BOX_MISSES_DATA"] and "short by 0 in x and 2 in y"
+          in r.findings[0][1],
+          "a box that misses the data only at the top is a finding that "
+          "names the y shortfall, never OK" + pinned)
+    r = assess(layer("a.t", outer, None, (1.0, -4.0, 9.0, 9.0)))
+    check(codes(r) == ["BOX_MISSES_DATA"] and "short by 0 in x and 4 in y"
+          in r.findings[0][1],
+          "and one that misses it only at the bottom" + pinned)
+    zero = (0.0, 0.0)
+    for corner, want, label in (
+            ((0.0, 0.0), True, "on the false origin"),
+            ((1.0, 1.0), True, "one unit away in both, the limit is inclusive"),
+            ((1.0, 0.0), True, "one unit away in x only"),
+            ((0.0, 1.0), True, "one unit away in y only"),
+            ((1.5, 0.0), False, "1.5 units away in x"),
+            ((0.0, 1.5), False, "1.5 units away in y"),
+            ((-500.0, 0.0), False, "500 units below it in x"),
+            ((0.0, -500.0), False, "500 units below it in y"),
+            ((-1.0, -1.0), True, "one unit below it in both")):
+        check(at_origin(corner + (9.0, 9.0), zero) is want,
+              "a corner %s %s the false origin"
+              % (label, "is on" if want else "is not on") + pinned)
+    r = assess(layer("dbo.roads", PLANET, DATA, DATA, **dict(
+        index_name="ix", column="shape", scheme="GEOMETRY_GRID",
+        grids=("16", "64", "64", "256"), cells="16")), origin=FO)
+    statements, skipped = build_script([r])
+    check(codes(r)[0] == "FALSE_ORIGIN_BOX" and len(statements) == 1
+          and statements[0].startswith("-- dbo.roads: FALSE_ORIGIN_BOX\n")
+          and not skipped,
+          "the headline case, a box at the false origin, gets a rebuild "
+          "statement" + pinned)
+    check(BOX_CODES == ("FALSE_ORIGIN_BOX", "BOX_MISSES_DATA", "BOX_TOO_BIG"),
+          "the codes that count as an index box finding are these three")
+
     # ---- the report
     results = [assess(layer("dbo.ok", GOOD, DATA, DATA)),
-               assess(layer("dbo.bad", PLANET, PLANET, DATA)),
-               assess(layer("dbo.thin", GOOD, DATA, None)),
+               assess(layer("dbo.bad", PLANET, PLANET, DATA), origin=FO),
+               assess(layer("dbo.thin", GOOD, DATA, None, notes=["a note"])),
                assess(layer("dbo.none"))]
     text = "\n".join(describe(results))
+    check(describe(results) == [
+        "spidxcheck: 4 layer(s)",
+        "OK         dbo.ok",
+        "FINDING    dbo.bad",
+        "    FALSE_ORIGIN_BOX: " + KINDS["BOX"][4] % ("-5000000", "-9000000"),
+        "    FALSE_ORIGIN_EXTENT: " + KINDS["EXTENT"][4]
+        % ("-5000000", "-9000000"),
+        "    index box     x -5000000..5000000  y -9000000..9000000",
+        "    stored extent x -5000000..5000000  y -9000000..9000000",
+        "    data envelope x 1000..5000  y 2000..6000",
+        "UNVERIFIED dbo.thin",
+        "    " + results[2].reason,
+        "    note: a note",
+        "    index box     x 900..5100  y 1900..6100",
+        "    stored extent x 1000..5000  y 2000..6000",
+        "UNKNOWN    dbo.none",
+        "    " + results[3].reason,
+        "",
+        "1 OK, 1 FINDING, 1 UNVERIFIED, 1 UNKNOWN",
+        "A finding is about speed and where a map opens. Esri documents that "
+        "a feature outside the index box is still returned by a spatial "
+        "query."],
+        "the report is exactly these lines, in this order: status, findings, "
+        "reason, notes, then the boxes of a layer that is not OK, a blank "
+        "line, the counts" + pinned)
     check("OK         dbo.ok" in text and "FINDING    dbo.bad" in text
           and "UNVERIFIED dbo.thin" in text and "UNKNOWN    dbo.none" in text,
           "the report puts the status before each layer name")
     check("1 OK, 1 FINDING, 1 UNVERIFIED, 1 UNKNOWN" in text,
           "the report counts each status")
-    check("index box" in text.split("dbo.bad")[1].split("UNVERIFIED")[0]
-          and "data envelope" in text,
+    check("    index box     x -5000000" in text.split("dbo.bad")[1]
+          .split("UNVERIFIED")[0],
           "a layer that is not OK shows the boxes it was judged on")
     check("x 900" not in text.split("dbo.ok")[1].split("FINDING")[0],
           "an OK layer shows no boxes")
@@ -1051,6 +1205,10 @@ def _self_test(tmp):
           "a report with a finding says the finding is about speed")
     check("speed and where" not in "\n".join(describe(results[:1])),
           "a report with no finding does not say it")
+    check("speed and where" in "\n".join(describe([results[1]]))
+          and "speed and where" not in "\n".join(describe([results[2]])),
+          "the sentence follows the finding count: a lone finding has it and "
+          "a lone unverified layer does not" + pinned)
 
     # ---- the rebuild statement
     base = dict(env=DATA, index_name="ix_roads", column="shape",
@@ -1063,7 +1221,8 @@ def _self_test(tmp):
                  "CELLS_PER_OBJECT = 16, DROP_EXISTING = ON);" and why is None,
           "a manual grid index is rebuilt with its own grids and cells, and "
           "a box that is the data grown by the pad")
-    auto = dict(base, scheme="", grids=("", "", "", ""), cells="8")
+    auto = dict(base, scheme="GEOMETRY_AUTO_GRID", grids=("", "", "", ""),
+                cells="8")
     sql, why = rebuild_statement(layer("dbo.roads", **auto), pad=0.25)
     check(sql.startswith("CREATE SPATIAL INDEX [ix_roads] ON [dbo].[roads] "
                          "([shape]) USING GEOMETRY_AUTO_GRID WITH "
@@ -1071,9 +1230,13 @@ def _self_test(tmp):
           and sql.endswith("CELLS_PER_OBJECT = 8, DROP_EXISTING = ON);"),
           "an auto grid index is rebuilt as auto grid, with no GRIDS clause")
     sql, _ = rebuild_statement(layer("dbo.roads", **dict(
-        auto, scheme="GEOMETRY_AUTO_GRID")))
+        auto, scheme="geometry_auto_grid")))
     check(sql is not None and "GEOMETRY_AUTO_GRID" in sql,
-          "a scheme named GEOMETRY_AUTO_GRID with no grids is auto grid")
+          "the scheme is read without regard to case")
+    sql, why = rebuild_statement(layer("dbo.roads", **dict(auto, scheme="")))
+    check(sql is None and "tessellation_scheme" in why,
+          "a blank scheme with blank grids is skipped, never guessed to be "
+          "an auto grid index" + pinned)
     sql, _ = rebuild_statement(layer("dbo.roads", **base))
     box = sql.split("BOUNDING_BOX = (")[1].split(")")[0].split(", ")
     check(float(box[0]) < 1000.0 and float(box[2]) > 5000.0
@@ -1098,10 +1261,17 @@ def _self_test(tmp):
         "manual scheme without grids": dict(base, grids=("", "", "", "")),
         "a grid of 32": dict(base, grids=("16", "32", "64", "256")),
         "a partial grid": dict(base, grids=("16", "", "64", "256")),
+        "a grid of 16.0": dict(base, grids=("16.0", "64", "64", "256")),
+        "an auto grid scheme but grids given": dict(
+            base, scheme="GEOMETRY_AUTO_GRID"),
+        "an auto grid scheme but one grid given": dict(
+            auto, grids=("16", "", "", "")),
+        "a geography scheme": dict(base, scheme="GEOGRAPHY_GRID"),
         "no cells": dict(base, cells=""),
         "cells of 0": dict(base, cells="0"),
         "cells of 8193": dict(base, cells="8193"),
         "cells of text": dict(base, cells="many"),
+        "cells of 16.0": dict(base, cells="16.0"),
     }
     for label, kw in sorted(expect.items()):
         sql, why = rebuild_statement(layer("dbo.roads", **kw))
@@ -1114,9 +1284,13 @@ def _self_test(tmp):
               base, cells="1")))[0] is not None,
           "cells of 1 and of 8192 are both accepted")
     check(ident("") is None and ident("a\tb") is None
-          and ident("a b") == "[a b]",
-          "an identifier that is empty or holds a control character is "
-          "refused and a space is allowed")
+          and ident("a\x1fb") is None and ident("a b") == "[a b]",
+          "an identifier that is empty or holds a control character, the "
+          "last of them included, is refused and a space is allowed" + pinned)
+    sql, _ = rebuild_statement(layer("a.b.c", **base))
+    check(" ON [a].[b.c] " in sql,
+          "a layer name is split at its first dot, so the table keeps the "
+          "rest")
 
     indexed = dict((k, v) for k, v in base.items() if k != "env")
     miss = assess(layer("dbo.roads", PLANET, DATA, DATA, **indexed))
@@ -1230,11 +1404,47 @@ def _self_test(tmp):
     bad_file("b1.csv", "", "an empty file is refused")
     bad_file("b2.csv", "name,box_xmin\nx,1\n",
              "a file with no layer column is refused")
+
+    def refusal(path):
+        try:
+            read_layers([path])
+        except ValueError as exc:
+            return str(exc)
+        return "no error was raised"
+
+    check("no layer column" in refusal(os.path.join(tmp, "b2.csv")),
+          "and the refusal says so, not that a name is blank" + pinned)
     bad_file("b3.csv", "layer,box_xmin\n  ,1\n", "a blank layer name is refused")
+    check("layer name is blank" in refusal(put("b3b.csv",
+                                               "layer,index_name\n  ,x\n")),
+          "a blank layer name is refused for that reason alone" + pinned)
+    qcols = lambda p: ",".join("%s_%s" % (p, c) for c in
+                               ("xmin", "ymin", "xmax", "ymax"))
+    one_point = read_layers([put("q1.csv", "layer,%s,%s\na.t,3,3,3,3,4,4,4,4\n"
+                                 % (qcols("ext"), qcols("env")))])[0]
+    check(one_point.ext == (3.0, 3.0, 3.0, 3.0)
+          and one_point.env == (4.0, 4.0, 4.0, 4.0),
+          "a stored extent and an envelope that are one point are read"
+          + pinned)
+    one_line = read_layers([put("q2.csv", "layer,%s,%s\na.t,3,1,3,9,1,5,9,5\n"
+                                % (qcols("ext"), qcols("env")))])[0]
+    check(one_line.ext == (3.0, 1.0, 3.0, 9.0)
+          and one_line.env == (1.0, 5.0, 9.0, 5.0),
+          "and so are ones that are a vertical or a horizontal line" + pinned)
+    bad_file("q3.csv", "layer,%s\na.t,3,1,3,9\n" % qcols("box"),
+             "an index box with no width in a file is refused" + pinned)
+    bad_file("q4.csv", "layer,%s\na.t,1,5,9,5\n" % qcols("box"),
+             "an index box with no height in a file is refused")
+    bad_file("q5.csv", "layer,%s\na.t,9,1,3,9\n" % qcols("ext"),
+             "a backwards stored extent in a file is refused")
+    bad_file("q6.csv", "layer,%s\na.t,1,9,3,2\n" % qcols("env"),
+             "a backwards envelope in a file is refused")
     bad_file("b4.csv", "layer,env_xmin,env_ymin,env_xmax,env_ymax\n"
              "a.t,1,2\n", "a short row with a missing box cell is refused")
     bad_file("b5.csv", "layer,index_name\nA.t,x\na.T,x\n",
              "the same layer twice in one file is refused, whatever its case")
+    bad_file("b5b.csv", "layer,index_name\nstra\u00dfe.t,x\nSTRASSE.T,x\n",
+             "the same layer twice is refused whatever its case, ss included")
     bad_file("b6.csv", "env_xmin,layer\n1\n",
              "a row too short to reach the layer column is a refusal, not a "
              "crash" + pinned)
@@ -1247,6 +1457,14 @@ def _self_test(tmp):
               + pinned)
     raises(lambda: read_layers([boxes, boxes]),
            "a box given in two files is refused")
+    for given, word in ((boxes, "box"), (extents, "ext"), (envs, "env")):
+        try:
+            read_layers([given, given])
+            said = "no error was raised"
+        except ValueError as exc:
+            said = str(exc)
+        check("its %s in two files" % word in said,
+              "the refusal of a %s given twice names it" % word)
     other = put("other.csv", "layer,index_name\ndbo.roads,ix_other\n")
     raises(lambda: read_layers([boxes, other]),
            "two different index names for one layer are refused")
@@ -1258,6 +1476,14 @@ def _self_test(tmp):
                  "level_4_grid\ndbo.roads,16,64,64,256\n")
     check(len(read_layers([boxes, other3])) == 3,
           "the same grids in two files are not a conflict")
+    padded = read_layers([put(
+        "pad.csv", "layer,index_name,spatial_column,cells_per_object,"
+        "level_1_grid\n  dbo.pad  , ix pad ,  shape  ,  8  ,  16  \n")])[0]
+    check(padded.name == "dbo.pad" and padded.index_name == "ix pad"
+          and padded.column == "shape" and padded.cells == "8"
+          and padded.grids == ("16", "", "", ""),
+          "spaces around a layer name, a text value and a grid are trimmed, "
+          "and one grid given alone is kept" + pinned)
     raises(lambda: read_layers([tmp]),
            "a directory is an OSError, not a ValueError", kind=OSError)
     raises(lambda: read_layers([os.path.join(tmp, "nope.csv")]),
@@ -1265,12 +1491,14 @@ def _self_test(tmp):
 
     # ---- the stub server, for the REST paths
     seen = []
+    sent_headers = []
 
     def box_json(box):
         return dict(zip(("xmin", "ymin", "xmax", "ymax"), box))
 
     def info(name, ext, supports=True):
-        body = {"name": name, "supportsReturningQueryExtent": supports}
+        body = {"name": name, "advancedQueryCapabilities":
+                {"supportsReturningQueryExtent": supports}}
         if ext is not None:
             body["extent"] = box_json(ext)
         return body
@@ -1287,8 +1515,20 @@ def _self_test(tmp):
             return 200, {"count": 9, "extent": box_json(PLANET)}
         if name == "NoQueryExtent":
             return 200, info(name, DATA, supports=False)
+        if name == "StringFlag":
+            return 200, info(name, DATA, supports="yes")
         if name == "NoSupportKey":
             return 200, {"name": name, "extent": box_json(DATA)}
+        if name == "TopLevelFlag":
+            return 200, {"name": name, "supportsReturningQueryExtent": True,
+                         "extent": box_json(DATA)}
+        if name in ("NanProbe", "NanEmpty"):
+            if where is None:
+                return 200, info(name, DATA)
+            nan = dict.fromkeys(("xmin", "ymin", "xmax", "ymax"), "NaN")
+            if name == "NanEmpty" or where == "1=0":
+                return 200, {"count": 0, "extent": nan}
+            return 200, {"count": 9, "extent": box_json(DATA)}
         if name == "EmptyAnswer":
             return 200, (info(name, DATA) if where is None else {"count": 0})
         if name == "NoLayerExtent":
@@ -1325,10 +1565,17 @@ def _self_test(tmp):
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             seen.append(self.path)
+            sent_headers.append(sorted(k.lower() for k in self.headers))
             path, _, query = self.path.partition("?")
             segs = path.split("/")
             is_query = segs[-1] == "query"
             name = segs[-4] if is_query else segs[-3]
+            if name == "Redirect":
+                self.send_response(302)
+                self.send_header("Location", "/elsewhere")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             where = None
             if is_query:
                 where = urllib.parse.parse_qs(query).get("where", [None])[0]
@@ -1356,6 +1603,7 @@ def _self_test(tmp):
     os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1,localhost"
     g = globals()
     saved_max = g["MAX_BODY"]
+    saved_opener = g["OPENER"]
 
     def url(name):
         return ("http://127.0.0.1:%d/arcgis/rest/services/%s/FeatureServer/0"
@@ -1394,6 +1642,19 @@ def _self_test(tmp):
 
         # ---- the extent reader
         check(extent_of(None, "x") is None, "an absent extent is None")
+        nan_box = dict.fromkeys(("xmin", "ymin", "xmax", "ymax"), "NaN")
+        check(extent_of(nan_box, "x") is None
+              and extent_of(dict.fromkeys(nan_box, float("nan")), "x") is None
+              and extent_of(dict.fromkeys(nan_box), "x") is None
+              and extent_of({}, "x") is None,
+              "an extent whose four values are NaN, null or absent is no "
+              "extent, which is how ArcGIS Server answers a query that "
+              "matches nothing" + pinned)
+        check(extent_of({"xmin": 1, "ymin": 2, "xmax": 1, "ymax": 2}, "x")
+              == (1.0, 2.0, 1.0, 2.0)
+              and extent_of({"xmin": 1, "ymin": 2, "xmax": 3, "ymax": 2}, "x")
+              == (1.0, 2.0, 3.0, 2.0),
+              "an extent with no width, or no height, is a box")
         check(extent_of({"xmin": 1, "ymin": 2.5, "xmax": 3, "ymax": 4}, "x")
               == (1.0, 2.5, 3.0, 4.0), "an extent object reads as a box")
         for label, value in (
@@ -1408,16 +1669,35 @@ def _self_test(tmp):
                  {"xmin": 1, "ymin": 5, "xmax": 2, "ymax": 2}),
                 ("an integer too large for a float",
                  {"xmin": 10 ** 400, "ymin": 1, "xmax": 1, "ymax": 2}),
-                ("a NaN", {"xmin": float("nan"), "ymin": 1, "xmax": 2,
-                           "ymax": 2})):
+                ("one NaN among four numbers",
+                 {"xmin": float("nan"), "ymin": 1, "xmax": 2, "ymax": 2}),
+                ("one NaN string among four numbers",
+                 {"xmin": "NaN", "ymin": 1, "xmax": 2, "ymax": 2}),
+                ("three NaN strings and a number",
+                 {"xmin": "NaN", "ymin": "NaN", "xmax": "NaN", "ymax": 2})):
             raises(lambda v=value: extent_of(v, "x"),
                    "%s is refused as an extent" % label, kind=RestError)
 
+        check(extent_of({"xmin": -1e299, "ymin": 0, "xmax": 1e299,
+                         "ymax": 1}, "x") == (-1e299, 0.0, 1e299, 1.0),
+              "a coordinate just under 1e300 is read")
+        raises(lambda: extent_of({"xmin": -1e301, "ymin": 0, "xmax": 0,
+                                  "ymax": 1}, "x"),
+               "a coordinate of -1e301 is refused as well" + pinned,
+               kind=RestError)
+        for size in (1e300, 1e301):
+            raises(lambda n=size: extent_of({"xmin": 0, "ymin": 0, "xmax": n,
+                                             "ymax": 1}, "x"),
+                   "a coordinate of %g is refused as no real coordinate" % size
+                   + pinned, kind=RestError)
+
         # ---- end to end against the stub
         code, out, err = go(["--rest", url("Healthy")])
-        check(code == 0 and "OK         Healthy/FeatureServer/0" in out,
-              "a layer whose advertised and queried extents agree is OK and "
-              "exits 0")
+        check(code == 4 and "UNVERIFIED Healthy/FeatureServer/0" in out
+              and "no index box was given" in out,
+              "a layer whose advertised and queried extents agree is "
+              "UNVERIFIED and exits 4, because REST cannot see an index"
+              + pinned)
         check(seen == ["/arcgis/rest/services/Healthy/FeatureServer/0?f=json",
                        "/arcgis/rest/services/Healthy/FeatureServer/0/query?"
                        "where=1%3D1&returnExtentOnly=true&f=json",
@@ -1426,11 +1706,39 @@ def _self_test(tmp):
               "it sent three requests: the layer, a returnExtentOnly query "
               "for where 1=1, and the same query for where 1=0, and nothing "
               "else, no token")
+        allowed = set(["accept", "accept-encoding", "connection", "host",
+                       "user-agent"])
+        check(len(sent_headers) == 3
+              and all(set(h) <= allowed for h in sent_headers),
+              "each request carries only the ordinary headers: no token, "
+              "cookie or authorization header" + pinned)
         check("probe passed" in out,
               "a server that returns no extent for a query that matches "
               "nothing passes the probe")
         check("127.0.0.1" not in out + err and str(port) not in out + err,
               "the report names the service path and never the host or port")
+        code, out, err = go(["--rest", url("NanProbe")])
+        check(code == 4 and "probe passed" in out
+              and "data envelope x 1000..5000" in out,
+              "a probe answered with NaN strings, as a real ArcGIS Server "
+              "does, passes and the query extent is used" + pinned)
+        code, out, err = go(["--rest", url("NanEmpty")])
+        check(code == 4 and "the query returned no extent" in out
+              and "UNKNOWN" in out and err == "",
+              "a layer with no features, answered with NaN, is UNKNOWN and "
+              "not a crash" + pinned)
+        code, out, err = go(["--rest", url("TopLevelFlag")])
+        check(code == 4 and "advancedQueryCapabilities" in out
+              and "UNKNOWN" in out,
+              "the flag is read from advancedQueryCapabilities, where Esri "
+              "puts it, and not from the top level" + pinned)
+        mark = len(seen)
+        code, out, err = go(["--rest", url("Redirect")])
+        check(code == 2 and "HTTP 302" in err
+              and seen[mark:] == ["/arcgis/rest/services/Redirect/"
+                                  "FeatureServer/0?f=json"],
+              "a redirect is not followed: the tool exits 2 and the redirect "
+              "target is never requested" + pinned)
         code, out, err = go(["--rest", url("Planet")])
         check(code == 1 and "EXTENT_TOO_BIG" in out,
               "a layer that advertises a continent-sized extent over small "
@@ -1444,11 +1752,15 @@ def _self_test(tmp):
         check(code == 4 and "supportsReturningQueryExtent" in out,
               "a layer that does not advertise returnExtentOnly support is "
               "UNKNOWN, not guessed")
+        code, out, err = go(["--rest", url("StringFlag")])
+        check(code == 4 and "does not advertise" in out,
+              "a capability flag that is the text yes, not true, is not "
+              "honored" + pinned)
         code, out, err = go(["--rest", url("NoSupportKey")])
         check(code == 4 and "supportsReturningQueryExtent" in out,
               "a layer with no such property is treated the same way")
         code, out, err = go(["--rest", url("EmptyAnswer")])
-        check(code == 4 and "returned no extent" in out,
+        check(code == 4 and "the query returned no extent" in out,
               "a query that returns no extent leaves the envelope unknown")
         code, out, err = go(["--rest", url("NoLayerExtent")])
         check(code == 4 and "UNKNOWN" in out,
@@ -1471,6 +1783,14 @@ def _self_test(tmp):
             code, out, err = go(["--rest", url(name)])
             check(code == 2 and want in err,
                   "%s exits 2 and says %s" % (name, want))
+        exact = len(json.dumps(info("Healthy", DATA)).encode("utf-8"))
+        g["MAX_BODY"] = exact
+        check(get_json(url("Healthy") + "?f=json", 5)["name"] == "Healthy",
+              "an answer exactly as long as the cap is read" + pinned)
+        g["MAX_BODY"] = exact - 1
+        raises(lambda: get_json(url("Healthy") + "?f=json", 5),
+               "an answer one byte over the cap is refused" + pinned,
+               kind=RestError)
         g["MAX_BODY"] = 20
         code, out, err = go(["--rest", url("Healthy")])
         g["MAX_BODY"] = saved_max
@@ -1486,6 +1806,45 @@ def _self_test(tmp):
               and "127.0.0.1" not in err,
               "a server that refuses the connection exits 2 without "
               "repeating the address")
+
+        class RefusingTls(object):
+            def open(self, *args, **kwargs):
+                raise urllib.error.URLError(ssl.SSLCertVerificationError(
+                    1, "certificate verify failed: certificate is not valid "
+                    "for 'tls-host.example'"))
+
+        g["OPENER"] = RefusingTls()
+        code, out, err = go(["--rest", "https://tls-host.example/a/"
+                             "FeatureServer/0"])
+        g["OPENER"] = saved_opener
+        check(code == 2 and "TLS" in err and out == ""
+              and "tls-host.example" not in err and "valid for" not in err,
+              "a certificate error exits 2 and does not repeat the host name "
+              "that the error text carries" + pinned)
+        plain = socket.socket()
+        plain.bind(("127.0.0.1", 0))
+        plain.listen(1)
+        plain_port = plain.getsockname()[1]
+
+        def answer_plain():
+            conn, _ = plain.accept()
+            try:
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.0 400 Bad Request\r\n\r\n")
+            finally:
+                conn.close()
+
+        talker = threading.Thread(target=answer_plain)
+        talker.daemon = True
+        talker.start()
+        code, out, err = go(["--rest", "https://127.0.0.1:%d/a/FeatureServer/"
+                             "0" % plain_port, "--timeout", "5"])
+        talker.join(10)
+        plain.close()
+        check(code == 2 and "could not read the server" in err
+              and "127.0.0.1" not in err and str(plain_port) not in err,
+              "https against a server that does not speak TLS exits 2 and "
+              "names neither the host nor the port")
         code, out, err = go(["--rest", "http://127.0.0.1:%d/a/FeatureServer/0?"
                              "token=SECRET" % port])
         check(code == 64 and "SECRET" not in out + err and out == "",
@@ -1499,6 +1858,7 @@ def _self_test(tmp):
               "CSV files and a REST layer are judged in one run")
     finally:
         g["MAX_BODY"] = saved_max
+        g["OPENER"] = saved_opener
         server.shutdown()
         server.server_close()
         thread.join()
@@ -1519,6 +1879,9 @@ def _self_test(tmp):
           and "OK         dbo.roads" in out and "OK         dbo.hydrants" in out
           and "BOX_TOO_BIG" in out and "EXTENT_TOO_BIG" in out,
           "three CSV files give one finding among three layers and exit 1")
+    check("No rebuild" not in out and "Check only" not in out
+          and "skipped" not in out,
+          "a run with no --script-out says nothing about a script" + pinned)
     code, out, err = go([boxes, extents, envs,
                          "--false-origin=-5000000,-9000000"])
     check(code == 1 and "FALSE_ORIGIN_BOX" in out
@@ -1546,6 +1909,13 @@ def _self_test(tmp):
           "a number that overflows is a usage error naming the problem")
     code, out, err = go(["--help"])
     check(code == 0 and "usage: spidxcheck.py" in out, "--help exits 0")
+    for given in (["--token", "S3CR3T-FLAG"], ["--token=S3CR3T-FLAG"]):
+        code, out, err = go([good_only] + given)
+        check(code == 64 and "unrecognized arguments" in err
+              and "S3CR3T-FLAG" not in err + out,
+              "a flag the tool does not have is refused with exit 64 and "
+              "neither it nor its value is repeated, in case it is a secret"
+              + pinned)
 
     # ---- the parser refuses a prefix of any flag. A parser that accepted
     # --self would start a nested self-test, so self_test is stubbed here and
@@ -1592,6 +1962,31 @@ def _self_test(tmp):
     check(go([good_only, "--tolerance", "0"])[0] == 0
           and go([good_only, "--pad", "1"])[0] == 0,
           "a tolerance of 0 and a pad of 1 are the accepted extremes")
+    check(go([good_only, "--timeout", "3600"])[0] == 0
+          and go([good_only, "--timeout", "3600.5"])[0] == 64
+          and go([good_only, "--timeout", "0.5"])[0] == 0,
+          "a timeout of 3600 seconds is accepted and a little above it is "
+          "not" + pinned)
+    check(go([good_only, "--oversize-ratio", "1.0001"])[0] in (0, 1)
+          and go([good_only, "--oversize-ratio", "1"])[0] == 64,
+          "an oversize ratio just above 1 is accepted and 1 is not")
+    defaults = parse([good_only])
+    check((defaults.pad, defaults.timeout, defaults.oversize_ratio,
+           defaults.tolerance) == (0.05, 15.0, 10.0, 1e-4),
+          "the defaults are the documented ones: pad 0.05, timeout 15, "
+          "ratio 10, tolerance 0.0001" + pinned)
+    for given in ("https://h/arcgis/rest/services/R/FeatureServer/0?token="
+                  "S3CRET", "http://user:pw@h/x.csv", "file:///x.csv"):
+        code, out, err = go([given])
+        check(code == 64 and out == "" and "--rest" in err
+              and "S3CRET" not in err and "pw" not in err
+              and "h/arcgis" not in err,
+              "%s given as a file is refused with exit 64 and is not "
+              "repeated" % ("an address with a token" if "S3" in given else
+                            "another address") + pinned)
+    check(WEB_ADDRESS.match("C:\\data\\x.csv") is None
+          and WEB_ADDRESS.match("data/x.csv") is None,
+          "a Windows path and a relative path are not web addresses")
 
     # ---- only --apply writes, and only the script
     out_sql = os.path.join(tmp, "rebuild.sql")
